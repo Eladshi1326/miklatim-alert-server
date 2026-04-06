@@ -1,12 +1,9 @@
 /**
- * Miklatim Alert Server v2
+ * Miklatim Alert Server v3
  *
- * Polls multiple alert sources for real-time rocket alerts in Israel.
- * When an alert comes in, sends push notifications to all users via Expo Push API.
- *
- * Sources (in priority order):
- * 1. Tzofar REST API (api.tzevaadom.co.il)
- * 2. Pikud HaOref API (oref.org.il) - requires Israeli IP
+ * Polls Tzofar REST API for real-time alerts in Israel.
+ * Sends push notifications to admin only (for testing phase).
+ * Supports ALL threat types.
  *
  * Deploy on Railway / Render / any Node.js host.
  */
@@ -21,11 +18,13 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
 
-// Alert sources
-const TZOFAR_API_URL = 'https://api.tzevaadom.co.il/notifications';
-const OREF_API_URL = 'https://www.oref.org.il/WarningMessages/alert/alerts.json';
+// Admin user ID - only this user gets alerts during testing
+const ADMIN_USER_ID = process.env.ADMIN_USER_ID || '';
 
-// Polling interval (2 seconds - fast enough for alerts)
+// Alert source
+const TZOFAR_API_URL = 'https://api.tzevaadom.co.il/notifications';
+
+// Polling interval
 const POLL_INTERVAL_MS = 2000;
 
 // Deduplication: remember alerts for 10 minutes
@@ -37,11 +36,10 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const seenAlerts = new Map();
 let totalAlertsSent = 0;
 let lastPollTime = null;
-let activeSources = { tzofar: false, oref: false };
+let sourceConnected = false;
 let pollCount = 0;
-let errorCount = 0;
 
-// Threat type labels
+// ALL threat type labels
 const THREAT_LABELS = {
   0: '🚀 ירי רקטות וטילים',
   1: '☢️ אירוע רדיולוגי',
@@ -50,9 +48,10 @@ const THREAT_LABELS = {
   4: '✈️ חדירת כלי טיס עוין',
   5: '☣️ חומרים מסוכנים',
   6: '🔫 חדירת מחבלים',
+  7: '✈️ חדירת כלי טיס עוין',
 };
 
-// ==================== LOGGING (minimal) ====================
+// ==================== LOGGING ====================
 
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
@@ -67,22 +66,36 @@ function isDuplicate(id) {
   return false;
 }
 
-// Cleanup old entries every 2 minutes
 setInterval(() => {
   const now = Date.now();
-  let cleaned = 0;
   for (const [id, ts] of seenAlerts) {
-    if (now - ts > DEDUP_TTL_MS) {
-      seenAlerts.delete(id);
-      cleaned++;
-    }
+    if (now - ts > DEDUP_TTL_MS) seenAlerts.delete(id);
   }
 }, 120000);
 
 // ==================== PUSH NOTIFICATIONS ====================
 
-async function getAllPushTokens() {
+/**
+ * Get push tokens - admin only during testing phase
+ */
+async function getTargetPushTokens() {
   try {
+    if (ADMIN_USER_ID) {
+      // Testing mode: only send to admin
+      const { data, error } = await supabase
+        .from('users')
+        .select('push_token')
+        .eq('id', ADMIN_USER_ID)
+        .single();
+
+      if (error || !data?.push_token) {
+        log(`No token for admin ${ADMIN_USER_ID}`);
+        return [];
+      }
+      return [data.push_token];
+    }
+
+    // Production mode: send to all users with tokens
     let allTokens = [];
     let offset = 0;
     const batchSize = 1000;
@@ -111,7 +124,7 @@ async function getAllPushTokens() {
 async function sendPushNotifications(tokens, title, body, data = {}) {
   if (!tokens.length) return;
 
-  log(`📤 Sending push to ${tokens.length} users: "${title}" - "${body}"`);
+  log(`📤 Push to ${tokens.length} user(s): "${title}" - "${body}"`);
 
   const BATCH_SIZE = 100;
   for (let i = 0; i < tokens.length; i += BATCH_SIZE) {
@@ -138,10 +151,10 @@ async function sendPushNotifications(tokens, title, body, data = {}) {
       const result = await response.json();
       const errors = (result.data || []).filter(r => r.status === 'error');
       if (errors.length > 0) {
-        log(`  Batch: ${batch.length - errors.length} OK, ${errors.length} errors`);
+        log(`  ${batch.length - errors.length} OK, ${errors.length} errors`);
       }
     } catch (err) {
-      log(`  Push batch failed: ${err.message}`);
+      log(`  Push failed: ${err.message}`);
     }
   }
 
@@ -156,12 +169,12 @@ async function processAlert(alertData) {
   const alertId = notificationId || `alert_${time}_${(cities || []).join('_').substring(0, 50)}`;
 
   if (isDuplicate(alertId)) return;
-  if (isDrill) {
-    log(`Drill alert, skipping: ${alertId}`);
-    return;
-  }
 
-  const threatLabel = THREAT_LABELS[threat] || '⚠️ התרעה';
+  // Don't skip drills - show them too but label them
+  const isDrillAlert = isDrill || false;
+  const threatLabel = isDrillAlert
+    ? `🔔 תרגיל - ${THREAT_LABELS[threat] || 'התרעה'}`
+    : (THREAT_LABELS[threat] || '⚠️ התרעה');
   const citiesStr = (cities || []).join(', ');
 
   log(`🚨 ALERT: ${threatLabel} - ${citiesStr}`);
@@ -172,27 +185,28 @@ async function processAlert(alertData) {
       notification_id: alertId,
       threat_type: threat || 0,
       cities: cities || [],
-      is_drill: false,
+      is_drill: isDrillAlert,
       alert_time: time ? new Date(time * 1000).toISOString() : new Date().toISOString(),
-    }).then(() => {});
+    });
   } catch (_) {}
 
-  // Send push to all users
-  const tokens = await getAllPushTokens();
+  // Send push
+  const tokens = await getTargetPushTokens();
   await sendPushNotifications(tokens, threatLabel, citiesStr || 'היכנס למרחב מוגן!', {
     type: 'rocket_alert',
     notificationId: alertId,
     threat: threat || 0,
     cities: cities || [],
+    isDrill: isDrillAlert,
   });
 }
 
-// ==================== POLLING SOURCES ====================
+// ==================== POLLING ====================
 
-/**
- * Poll Tzofar REST API
- */
-async function pollTzofar() {
+async function poll() {
+  lastPollTime = new Date().toISOString();
+  pollCount++;
+
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 4000);
@@ -207,18 +221,20 @@ async function pollTzofar() {
     clearTimeout(timeout);
 
     if (!response.ok) {
-      if (!activeSources.tzofar) return; // Don't spam logs
-      activeSources.tzofar = false;
+      if (sourceConnected) {
+        sourceConnected = false;
+        log('⚠️ Tzofar API disconnected');
+      }
       return;
     }
 
     const data = await response.json();
-    if (!activeSources.tzofar) {
-      activeSources.tzofar = true;
+    if (!sourceConnected) {
+      sourceConnected = true;
       log('✅ Tzofar API connected');
     }
 
-    // Handle response format - could be array or object with notifications
+    // Handle response format
     let alerts = [];
     if (Array.isArray(data)) {
       alerts = data;
@@ -240,82 +256,10 @@ async function pollTzofar() {
       }
     }
   } catch (err) {
-    if (err.name === 'AbortError') return; // Timeout, silent
-    if (activeSources.tzofar) {
-      activeSources.tzofar = false;
+    if (err.name !== 'AbortError' && sourceConnected) {
+      sourceConnected = false;
     }
   }
-}
-
-/**
- * Poll Pikud HaOref API (fallback - only works from Israeli IP)
- */
-async function pollOref() {
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 4000);
-
-    const response = await fetch(OREF_API_URL, {
-      headers: {
-        'Referer': 'https://www.oref.org.il/',
-        'X-Requested-With': 'XMLHttpRequest',
-        'User-Agent': 'Mozilla/5.0',
-      },
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
-
-    if (!response.ok) {
-      activeSources.oref = false;
-      return;
-    }
-
-    const text = await response.text();
-    if (!text || text.trim() === '' || text.trim() === '[]') {
-      // No active alerts - this is normal
-      if (!activeSources.oref) {
-        activeSources.oref = true;
-        log('✅ Oref API connected');
-      }
-      return;
-    }
-
-    if (!activeSources.oref) {
-      activeSources.oref = true;
-      log('✅ Oref API connected');
-    }
-
-    const cleanText = text.replace(/^\uFEFF/, '');
-    const alerts = JSON.parse(cleanText);
-
-    if (!Array.isArray(alerts)) return;
-
-    for (const alert of alerts) {
-      await processAlert({
-        notificationId: alert.notificationId || `oref_${Date.now()}`,
-        threat: alert.threat ?? 0,
-        isDrill: alert.isDrill || false,
-        cities: alert.cities || [],
-        time: alert.time || Math.floor(Date.now() / 1000),
-      });
-    }
-  } catch (err) {
-    if (err.name === 'AbortError') return;
-    activeSources.oref = false;
-  }
-}
-
-// ==================== MAIN POLL LOOP ====================
-
-async function poll() {
-  lastPollTime = new Date().toISOString();
-  pollCount++;
-
-  // Poll both sources in parallel
-  await Promise.allSettled([
-    pollTzofar(),
-    pollOref(),
-  ]);
 }
 
 // ==================== HEALTH CHECK SERVER ====================
@@ -327,7 +271,9 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       status: 'running',
-      sources: activeSources,
+      version: 3,
+      source: sourceConnected ? 'connected' : 'disconnected',
+      mode: ADMIN_USER_ID ? 'admin-only' : 'all-users',
       pollCount,
       seenAlerts: seenAlerts.size,
       totalAlertsSent,
@@ -335,7 +281,6 @@ const server = http.createServer((req, res) => {
       uptime: Math.floor(process.uptime()),
     }));
   } else if (req.url === '/test-push') {
-    // Manual test endpoint - send test alert to all users
     processAlert({
       notificationId: `test_${Date.now()}`,
       threat: 0,
@@ -358,31 +303,28 @@ const server = http.createServer((req, res) => {
 // ==================== START ====================
 
 function start() {
-  log('🚀 Miklatim Alert Server v2 starting...');
+  log('🚀 Miklatim Alert Server v3');
 
   if (!SUPABASE_URL || !SUPABASE_KEY) {
     console.error('Missing SUPABASE_URL or SUPABASE_SERVICE_KEY!');
     process.exit(1);
   }
 
-  log(`Supabase: ${SUPABASE_URL}`);
-  log(`Polling interval: ${POLL_INTERVAL_MS}ms`);
+  log(`Mode: ${ADMIN_USER_ID ? 'ADMIN ONLY (' + ADMIN_USER_ID + ')' : 'ALL USERS'}`);
+  log(`Source: Tzofar API (${TZOFAR_API_URL})`);
 
-  // Start HTTP server
   server.listen(PORT, () => {
     log(`Health server on port ${PORT}`);
   });
 
-  // Start polling loop
   setInterval(poll, POLL_INTERVAL_MS);
-  poll(); // First poll immediately
+  poll();
 
-  // Log status every 5 minutes (minimal logging)
+  // Status log every 5 minutes
   setInterval(() => {
-    log(`📊 Status: polls=${pollCount}, alerts=${totalAlertsSent}, sources=${JSON.stringify(activeSources)}, seen=${seenAlerts.size}`);
+    log(`📊 polls=${pollCount} alerts=${totalAlertsSent} source=${sourceConnected ? 'OK' : 'DOWN'} seen=${seenAlerts.size}`);
   }, 300000);
 
-  // Graceful shutdown
   process.on('SIGTERM', () => {
     log('Shutting down...');
     server.close();
