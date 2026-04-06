@@ -51,11 +51,14 @@ const THREAT_LABELS = {
   7: '✈️ חדירת כלי טיס עוין',
   8: '🔥 שריפה',
   9: '🌀 אירוע חומ"ס',
-  10: '✅ חזרה לשגרה',
+  10: '🔴 התרעה מקדימה',
   11: '⚠️ התראה כללית',
   12: '💣 חבלה / פיצוץ',
   13: '🛡️ היערכות',
 };
+
+// Pikud HaOref newsFlash category = 10
+const NEWSFLASH_THREAT = 10;
 
 // ==================== LOGGING ====================
 
@@ -170,7 +173,7 @@ async function sendPushNotifications(tokens, title, body, data = {}) {
 // ==================== ALERT PROCESSING ====================
 
 async function processAlert(alertData) {
-  const { notificationId, threat, isDrill, cities, time } = alertData;
+  const { notificationId, threat, isDrill, cities, time, description } = alertData;
 
   const alertId = notificationId || `alert_${time}_${(cities || []).join('_').substring(0, 50)}`;
 
@@ -182,6 +185,9 @@ async function processAlert(alertData) {
     ? `🔔 תרגיל - ${THREAT_LABELS[threat] || 'התרעה'}`
     : (THREAT_LABELS[threat] || '⚠️ התרעה');
   const citiesStr = (cities || []).join(', ');
+
+  // For early warnings, use the full description text
+  const isEarlyWarning = threat === NEWSFLASH_THREAT;
 
   log(`🚨 ALERT: ${threatLabel} - ${citiesStr}`);
 
@@ -198,12 +204,25 @@ async function processAlert(alertData) {
 
   // Send push
   const tokens = await getTargetPushTokens();
-  await sendPushNotifications(tokens, threatLabel, citiesStr || 'היכנס למרחב מוגן!', {
-    type: 'rocket_alert',
+
+  // Build notification body
+  let pushBody;
+  if (isEarlyWarning && description) {
+    // Early warning: show full description + areas
+    pushBody = citiesStr
+      ? `${description}\n\nאזורים: ${citiesStr}`
+      : description;
+  } else {
+    pushBody = citiesStr || 'היכנס למרחב מוגן!';
+  }
+
+  await sendPushNotifications(tokens, threatLabel, pushBody, {
+    type: isEarlyWarning ? 'early_warning' : 'rocket_alert',
     notificationId: alertId,
     threat: threat || 0,
     cities: cities || [],
     isDrill: isDrillAlert,
+    isEarlyWarning,
   });
 }
 
@@ -251,7 +270,27 @@ async function poll() {
     }
 
     for (const alert of alerts) {
-      if (alert.cities && alert.cities.length > 0) {
+      // Detect newsFlash / early warning (התרעה מקדימה)
+      const isNewsFlash = alert.cat === 10 || alert.category === 10
+        || alert.type === 'newsFlash' || alert.type === 'earlyWarning'
+        || (alert.title && alert.title.includes('התרעה מקדימה'))
+        || (alert.desc && alert.desc.includes('התרעה מקדימה'));
+
+      if (isNewsFlash) {
+        // Early warning - areas (not cities), with descriptive text
+        const areas = alert.cities || alert.areas || alert.zones || [];
+        const description = alert.desc || alert.description || alert.body
+          || alert.instructions || 'זוהו שיגורים - היכנסו למרחב מוגן!';
+        await processAlert({
+          notificationId: alert.notificationId || alert.id || `newsflash_${Date.now()}`,
+          threat: NEWSFLASH_THREAT,
+          isDrill: alert.isDrill || false,
+          cities: areas,
+          time: alert.time || Math.floor(Date.now() / 1000),
+          description,
+        });
+      } else if (alert.cities && alert.cities.length > 0) {
+        // Regular alert (missiles, infiltration, etc.)
         await processAlert({
           notificationId: alert.notificationId || alert.id || `tzofar_${Date.now()}`,
           threat: alert.threat ?? 0,
