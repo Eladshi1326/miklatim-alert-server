@@ -39,7 +39,7 @@ let lastPollTime = null;
 let sourceConnected = false;
 let pollCount = 0;
 
-// ALL threat type labels
+// ALL threat type labels (Tzofar/Pikud HaOref types)
 const THREAT_LABELS = {
   0: '🚀 ירי רקטות וטילים',
   1: '☢️ אירוע רדיולוגי',
@@ -49,6 +49,12 @@ const THREAT_LABELS = {
   5: '☣️ חומרים מסוכנים',
   6: '🔫 חדירת מחבלים',
   7: '✈️ חדירת כלי טיס עוין',
+  8: '🔥 שריפה',
+  9: '🌀 אירוע חומ"ס',
+  10: '✅ חזרה לשגרה',
+  11: '⚠️ התראה כללית',
+  12: '💣 חבלה / פיצוץ',
+  13: '🛡️ היערכות',
 };
 
 // ==================== LOGGING ====================
