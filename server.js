@@ -23,8 +23,8 @@ const ADMIN_USER_ID = process.env.ADMIN_USER_ID || '';
 
 // Alert sources
 const TZOFAR_API_URL = 'https://api.tzevaadom.co.il/notifications';
-const OREF_ALERTS_URL = 'https://www.oref.org.il/WarningMessages/alert/alerts.json';
-const OREF_HISTORY_URL = 'https://www.oref.org.il/WarningMessages/History/AlertsHistory.json';
+const OREF_PROXY_URL = process.env.OREF_PROXY_URL || '';
+const OREF_ALERTS_URL = OREF_PROXY_URL || 'https://www.oref.org.il/WarningMessages/alert/alerts.json';
 
 // Polling interval
 const POLL_INTERVAL_MS = 2000;
