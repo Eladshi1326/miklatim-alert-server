@@ -21,8 +21,10 @@ const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
 // Admin user ID - only this user gets alerts during testing
 const ADMIN_USER_ID = process.env.ADMIN_USER_ID || '';
 
-// Alert source
+// Alert sources
 const TZOFAR_API_URL = 'https://api.tzevaadom.co.il/notifications';
+const OREF_ALERTS_URL = 'https://www.oref.org.il/WarningMessages/alert/alerts.json';
+const OREF_HISTORY_URL = 'https://www.oref.org.il/WarningMessages/History/AlertsHistory.json';
 
 // Polling interval
 const POLL_INTERVAL_MS = 2000;
@@ -37,7 +39,9 @@ const seenAlerts = new Map();
 let totalAlertsSent = 0;
 let lastPollTime = null;
 let sourceConnected = false;
+let orefConnected = false;
 let pollCount = 0;
+let orefPollCount = 0;
 
 // ALL threat type labels (Tzofar/Pikud HaOref types)
 const THREAT_LABELS = {
@@ -307,6 +311,110 @@ async function poll() {
   }
 }
 
+// ==================== OREF API POLLING (for newsFlash / early warnings) ====================
+
+// Pikud HaOref alert category mapping
+const OREF_CATEGORY_MAP = {
+  1: 0,   // missiles
+  2: 1,   // radiologicalEvent
+  3: 2,   // earthQuake
+  4: 3,   // tsunami
+  5: 4,   // hostileAircraftIntrusion
+  6: 5,   // hazardousMaterials
+  7: 6,   // terroristInfiltration
+  10: NEWSFLASH_THREAT, // newsFlash / early warning
+  13: NEWSFLASH_THREAT, // newsFlash (history format)
+  14: NEWSFLASH_THREAT, // newsFlash (history format alt)
+};
+
+async function pollOref() {
+  orefPollCount++;
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 4000);
+
+    const response = await fetch(OREF_ALERTS_URL, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json',
+        'Referer': 'https://www.oref.org.il/',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Accept-Language': 'he-IL,he;q=0.9',
+      },
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+
+    if (!response.ok) {
+      if (orefConnected) {
+        orefConnected = false;
+        log('⚠️ Oref API disconnected (status ' + response.status + ')');
+      }
+      return;
+    }
+
+    // Oref API sometimes returns empty string or BOM characters
+    let text = await response.text();
+    text = text.replace(/^\uFEFF/, '').trim();
+
+    if (!text || text === '[]' || text === 'null') {
+      if (!orefConnected) {
+        orefConnected = true;
+        log('✅ Oref API connected');
+      }
+      return;
+    }
+
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch (_) {
+      return;
+    }
+
+    if (!orefConnected) {
+      orefConnected = true;
+      log('✅ Oref API connected');
+    }
+
+    // Oref returns either a single object or array
+    const alerts = Array.isArray(data) ? data : [data];
+
+    for (const alert of alerts) {
+      const cat = parseInt(alert.cat || alert.category || '0');
+      const threat = OREF_CATEGORY_MAP[cat] ?? 0;
+      const isNewsFlash = threat === NEWSFLASH_THREAT;
+
+      // Build cities/areas from Oref format
+      const cities = alert.data
+        ? (typeof alert.data === 'string' ? alert.data.split(',').map(s => s.trim()) : alert.data)
+        : (alert.cities || []);
+
+      if (cities.length === 0 && !isNewsFlash) continue;
+
+      const alertId = `oref_${alert.id || cat + '_' + Date.now()}`;
+
+      const description = isNewsFlash
+        ? (alert.title || alert.desc || 'התרעה מקדימה - היכנסו למרחב מוגן!')
+        : undefined;
+
+      await processAlert({
+        notificationId: alertId,
+        threat,
+        isDrill: alert.isDrill || false,
+        cities,
+        time: Math.floor(Date.now() / 1000),
+        description,
+      });
+    }
+  } catch (err) {
+    if (err.name !== 'AbortError' && orefConnected) {
+      orefConnected = false;
+    }
+  }
+}
+
 // ==================== HEALTH CHECK SERVER ====================
 
 const PORT = process.env.PORT || 3000;
@@ -316,10 +424,12 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       status: 'running',
-      version: 3,
-      source: sourceConnected ? 'connected' : 'disconnected',
+      version: 4,
+      tzofar: sourceConnected ? 'connected' : 'disconnected',
+      oref: orefConnected ? 'connected' : 'disconnected',
       mode: ADMIN_USER_ID ? 'admin-only' : 'all-users',
       pollCount,
+      orefPollCount,
       seenAlerts: seenAlerts.size,
       totalAlertsSent,
       lastPoll: lastPollTime,
@@ -339,6 +449,21 @@ const server = http.createServer((req, res) => {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: err.message }));
     });
+  } else if (req.url === '/test-early-warning') {
+    processAlert({
+      notificationId: `test_ew_${Date.now()}`,
+      threat: NEWSFLASH_THREAT,
+      isDrill: false,
+      cities: ['שפלת יהודה', 'דן', 'ירקון', 'השפלה', 'שרון'],
+      time: Math.floor(Date.now() / 1000),
+      description: 'בעקבות זיהוי שיגורים, בדקות הקרובות צפויות להתקבל התרעות',
+    }).then(() => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ sent: true, type: 'early_warning' }));
+    }).catch(err => {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    });
   } else {
     res.writeHead(404);
     res.end('Not found');
@@ -348,7 +473,7 @@ const server = http.createServer((req, res) => {
 // ==================== START ====================
 
 function start() {
-  log('🚀 Miklatim Alert Server v3');
+  log('🚀 Miklatim Alert Server v4');
 
   if (!SUPABASE_URL || !SUPABASE_KEY) {
     console.error('Missing SUPABASE_URL or SUPABASE_SERVICE_KEY!');
@@ -356,18 +481,23 @@ function start() {
   }
 
   log(`Mode: ${ADMIN_USER_ID ? 'ADMIN ONLY (' + ADMIN_USER_ID + ')' : 'ALL USERS'}`);
-  log(`Source: Tzofar API (${TZOFAR_API_URL})`);
+  log(`Sources: Tzofar (${TZOFAR_API_URL}) + Oref (${OREF_ALERTS_URL})`);
 
   server.listen(PORT, () => {
     log(`Health server on port ${PORT}`);
   });
 
+  // Tzofar polling - regular alerts (every 2s)
   setInterval(poll, POLL_INTERVAL_MS);
   poll();
 
+  // Oref polling - newsFlash / early warnings (every 2s)
+  setInterval(pollOref, POLL_INTERVAL_MS);
+  setTimeout(pollOref, 1000); // stagger by 1s
+
   // Status log every 5 minutes
   setInterval(() => {
-    log(`📊 polls=${pollCount} alerts=${totalAlertsSent} source=${sourceConnected ? 'OK' : 'DOWN'} seen=${seenAlerts.size}`);
+    log(`📊 tzofar=${pollCount} oref=${orefPollCount} alerts=${totalAlertsSent} tzofar=${sourceConnected ? 'OK' : 'DOWN'} oref=${orefConnected ? 'OK' : 'DOWN'} seen=${seenAlerts.size}`);
   }, 300000);
 
   process.on('SIGTERM', () => {
