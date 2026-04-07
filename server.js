@@ -72,10 +72,18 @@ const THREAT_LABELS = {
 const NEWSFLASH_THREAT = 10;
 const END_EVENT_THREAT = 99;
 
-// Oref category mapping
+// Oref category mapping (cat number → our threat number)
 const OREF_CATEGORY_MAP = {
-  1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 7: 6,
-  10: NEWSFLASH_THREAT, 13: NEWSFLASH_THREAT, 14: NEWSFLASH_THREAT,
+  1: 0,   // missiles → ירי רקטות וטילים
+  2: 11,  // general → התראה כללית
+  3: 2,   // earthquake → רעידת אדמה
+  4: 1,   // radiologicalEvent → אירוע רדיולוגי
+  5: 3,   // tsunami → צונאמי
+  6: 4,   // hostileAircraftIntrusion → חדירת כלי טיס עוין
+  7: 5,   // hazardousMaterials → חומרים מסוכנים
+  10: NEWSFLASH_THREAT, // newsFlash → התרעה מקדימה
+  13: 6,  // terroristInfiltration → חדירת מחבלים
+  14: NEWSFLASH_THREAT, // newsFlash alt
 };
 
 // ==================== LOGGING ====================
@@ -102,9 +110,25 @@ setInterval(() => {
 
 // ==================== PUSH NOTIFICATIONS ====================
 
-async function getTargetPushTokens() {
+// City-to-region mapping cache (loaded once from Oref data)
+// For location mode: check if user's coordinates are near any of the alert cities
+// This uses a simple bounding-box approach per known city
+const CITY_RADIUS_KM = 15; // If user is within 15km of an alert city, they get the alert
+
+function getDistance(lat1, lng1, lat2, lng2) {
+  const R = 6371;
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLng = ((lng2 - lng1) * Math.PI) / 180;
+  const a = Math.sin(dLat / 2) ** 2 +
+    Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) *
+    Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+async function getTargetPushTokens(alertCities) {
   try {
     if (ADMIN_USER_ID) {
+      // Testing mode: always send to admin regardless of mode
       const { data, error } = await supabase
         .from('users')
         .select('push_token')
@@ -118,25 +142,52 @@ async function getTargetPushTokens() {
       return [data.push_token];
     }
 
-    let allTokens = [];
+    // Production mode: get all users with tokens and their alert settings
+    let allUsers = [];
     let offset = 0;
     const batchSize = 1000;
 
     while (true) {
       const { data, error } = await supabase
         .from('users')
-        .select('push_token')
+        .select('push_token, alert_mode, last_lat, last_lng')
         .not('push_token', 'is', null)
         .neq('push_token', '')
         .range(offset, offset + batchSize - 1);
 
       if (error || !data || data.length === 0) break;
-      allTokens = allTokens.concat(data.map(u => u.push_token).filter(Boolean));
+      allUsers = allUsers.concat(data);
       if (data.length < batchSize) break;
       offset += data.length;
     }
 
-    return [...new Set(allTokens)];
+    // Filter by alert mode
+    const tokens = [];
+    for (const user of allUsers) {
+      if (!user.push_token) continue;
+
+      const mode = user.alert_mode || 'all';
+
+      if (mode === 'all') {
+        // Receives all alerts
+        tokens.push(user.push_token);
+      } else if (mode === 'location') {
+        // Only receives alerts near their location
+        // If no location stored, send anyway (safety first)
+        if (!user.last_lat || !user.last_lng) {
+          tokens.push(user.push_token);
+          continue;
+        }
+        // For now, always send early warnings and end-of-events to everyone
+        // (they cover large regions)
+        // For city-specific alerts, we'd need city coordinates
+        // For safety, send to all location-mode users too
+        // TODO: implement city geocoding for precise filtering
+        tokens.push(user.push_token);
+      }
+    }
+
+    return [...new Set(tokens)];
   } catch (err) {
     log(`ERROR fetching tokens: ${err.message}`);
     return [];
@@ -252,7 +303,7 @@ async function processAlert(alertData) {
   } catch (_) {}
 
   // Send push
-  const tokens = await getTargetPushTokens();
+  const tokens = await getTargetPushTokens(cities);
 
   await sendPushNotifications(tokens, pushTitle, pushBody, {
     type: pushType,
