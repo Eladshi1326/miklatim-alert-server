@@ -26,6 +26,7 @@ const ADMIN_USER_ID = process.env.ADMIN_USER_ID || '';
 
 // Alert sources
 const TZOFAR_API_URL = 'https://api.tzevaadom.co.il/notifications';
+const TZOFAR_ENABLED = process.env.TZOFAR_ENABLED === 'true'; // Disabled by default
 
 // Oref API - only works from Israeli IP or via proxy
 const OREF_PROXY_URL = process.env.OREF_PROXY_URL || '';
@@ -34,7 +35,7 @@ const OREF_ALERTS_URL = OREF_PROXY_URL || 'https://www.oref.org.il/WarningMessag
 const OREF_ENABLED = !!OREF_PROXY_URL; // Only poll Oref if proxy is configured
 
 // Polling interval
-const POLL_INTERVAL_MS = 2000;
+const POLL_INTERVAL_MS = 1000;
 
 // Deduplication: remember alerts for 10 minutes
 const DEDUP_TTL_MS = 10 * 60 * 1000;
@@ -470,7 +471,7 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify({
       status: 'running',
       version: 5,
-      tzofar: sourceConnected ? 'connected' : 'disconnected',
+      tzofar: TZOFAR_ENABLED ? (sourceConnected ? 'connected' : 'disconnected') : 'disabled',
       oref: OREF_ENABLED ? (orefConnected ? 'connected' : 'disconnected') : 'disabled',
       mode: ADMIN_USER_ID ? 'admin-only' : 'all-users',
       pollCount,
@@ -543,26 +544,29 @@ function start() {
   }
 
   log(`Mode: ${ADMIN_USER_ID ? 'ADMIN ONLY (' + ADMIN_USER_ID + ')' : 'ALL USERS'}`);
-  log(`Tzofar: ${TZOFAR_API_URL}`);
+  log(`Tzofar: ${TZOFAR_ENABLED ? TZOFAR_API_URL : 'DISABLED'}`);
   log(`Oref: ${OREF_ENABLED ? OREF_ALERTS_URL : 'DISABLED (no proxy configured)'}`);
+  log(`Poll interval: ${POLL_INTERVAL_MS}ms`);
 
   server.listen(PORT, () => {
     log(`Health server on port ${PORT}`);
   });
 
-  // Tzofar polling (every 2s)
-  setInterval(poll, POLL_INTERVAL_MS);
-  poll();
+  // Tzofar polling - only if enabled
+  if (TZOFAR_ENABLED) {
+    setInterval(poll, POLL_INTERVAL_MS);
+    poll();
+  }
 
-  // Oref polling (every 2s) - only if proxy is configured
+  // Oref polling - only if proxy is configured
   if (OREF_ENABLED) {
     setInterval(pollOref, POLL_INTERVAL_MS);
-    setTimeout(pollOref, 1000);
+    setTimeout(pollOref, 500);
   }
 
   // Status log every 5 minutes
   setInterval(() => {
-    log(`📊 polls=${pollCount} oref=${orefPollCount} alerts=${totalAlertsSent} tzofar=${sourceConnected ? 'OK' : 'DOWN'} oref=${OREF_ENABLED ? (orefConnected ? 'OK' : 'DOWN') : 'OFF'} seen=${seenAlerts.size}`);
+    log(`📊 tzofar=${TZOFAR_ENABLED ? pollCount : 'OFF'} oref=${OREF_ENABLED ? orefPollCount : 'OFF'} alerts=${totalAlertsSent} seen=${seenAlerts.size}`);
   }, 300000);
 
   process.on('SIGTERM', () => {
