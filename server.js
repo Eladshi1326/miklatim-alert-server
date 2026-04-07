@@ -61,8 +61,9 @@ const THREAT_LABELS = {
   13: '🛡️ היערכות',
 };
 
-// Pikud HaOref newsFlash category = 10
+// Special threat types for newsFlash subtypes
 const NEWSFLASH_THREAT = 10;
+const END_EVENT_THREAT = 99; // custom type for "end of event"
 
 // ==================== LOGGING ====================
 
@@ -177,23 +178,60 @@ async function sendPushNotifications(tokens, title, body, data = {}) {
 // ==================== ALERT PROCESSING ====================
 
 async function processAlert(alertData) {
-  const { notificationId, threat, isDrill, cities, time, description } = alertData;
+  const { notificationId, threat, isDrill, cities, time, description, title } = alertData;
 
   const alertId = notificationId || `alert_${time}_${(cities || []).join('_').substring(0, 50)}`;
 
   if (isDuplicate(alertId)) return;
 
-  // Don't skip drills - show them too but label them
   const isDrillAlert = isDrill || false;
-  const threatLabel = isDrillAlert
-    ? `🔔 תרגיל - ${THREAT_LABELS[threat] || 'התרעה'}`
-    : (THREAT_LABELS[threat] || '⚠️ התרעה');
   const citiesStr = (cities || []).join(', ');
 
-  // For early warnings, use the full description text
-  const isEarlyWarning = threat === NEWSFLASH_THREAT;
+  // Determine alert subtype for cat 10 (newsFlash)
+  const isEndOfEvent = threat === END_EVENT_THREAT
+    || (threat === NEWSFLASH_THREAT && title && (
+      title.includes('הסתיים') || title.includes('סיום') || title.includes('חזרה לשגרה')
+    ))
+    || (description && (
+      description.includes('יכולים לצאת') || description.includes('הסתיים')
+    ));
 
-  log(`🚨 ALERT: ${threatLabel} - ${citiesStr}`);
+  const isEarlyWarning = !isEndOfEvent && (
+    threat === NEWSFLASH_THREAT
+    || (title && (title.includes('התרעה מקדימה') || title.includes('זיהוי שיגורים')))
+    || (description && description.includes('זיהוי שיגורים'))
+  );
+
+  // Build push title
+  let pushTitle;
+  if (isEndOfEvent) {
+    pushTitle = isDrillAlert ? '🔔 תרגיל - ✅ סיום אירוע' : '✅ סיום אירוע';
+  } else if (isEarlyWarning) {
+    pushTitle = isDrillAlert ? '🔔 תרגיל - 🔴 התרעה מקדימה' : '🔴 התרעה מקדימה';
+  } else {
+    pushTitle = isDrillAlert
+      ? `🔔 תרגיל - ${THREAT_LABELS[threat] || 'התרעה'}`
+      : (THREAT_LABELS[threat] || '⚠️ התרעה');
+  }
+
+  // Build push body
+  let pushBody;
+  if (isEndOfEvent) {
+    pushBody = description || 'האירוע הסתיים. השוהים במרחב המוגן יכולים לצאת.';
+    if (citiesStr) pushBody += `\n${citiesStr}`;
+  } else if (isEarlyWarning) {
+    pushBody = description || 'בעקבות זיהוי שיגורים, צפויות התרעות בדקות הקרובות';
+    if (citiesStr) pushBody += `\n\nאזורים: ${citiesStr}`;
+  } else {
+    pushBody = citiesStr || 'היכנס למרחב מוגן!';
+  }
+
+  // Determine notification type for app navigation
+  let pushType = 'rocket_alert';
+  if (isEndOfEvent) pushType = 'end_of_event';
+  else if (isEarlyWarning) pushType = 'early_warning';
+
+  log(`🚨 ALERT [${pushType}]: ${pushTitle} - ${citiesStr.substring(0, 80)}`);
 
   // Log to Supabase
   try {
@@ -209,24 +247,14 @@ async function processAlert(alertData) {
   // Send push
   const tokens = await getTargetPushTokens();
 
-  // Build notification body
-  let pushBody;
-  if (isEarlyWarning && description) {
-    // Early warning: show full description + areas
-    pushBody = citiesStr
-      ? `${description}\n\nאזורים: ${citiesStr}`
-      : description;
-  } else {
-    pushBody = citiesStr || 'היכנס למרחב מוגן!';
-  }
-
-  await sendPushNotifications(tokens, threatLabel, pushBody, {
-    type: isEarlyWarning ? 'early_warning' : 'rocket_alert',
+  await sendPushNotifications(tokens, pushTitle, pushBody, {
+    type: pushType,
     notificationId: alertId,
     threat: threat || 0,
     cities: cities || [],
     isDrill: isDrillAlert,
     isEarlyWarning,
+    isEndOfEvent,
   });
 }
 
@@ -274,23 +302,42 @@ async function poll() {
     }
 
     for (const alert of alerts) {
+      const alertTitle = alert.title || alert.name || '';
+      const alertDesc = alert.desc || alert.description || alert.body || '';
+
       // Detect newsFlash / early warning (התרעה מקדימה)
       const isNewsFlash = alert.cat === 10 || alert.category === 10
         || alert.type === 'newsFlash' || alert.type === 'earlyWarning'
-        || (alert.title && alert.title.includes('התרעה מקדימה'))
-        || (alert.desc && alert.desc.includes('התרעה מקדימה'));
+        || alertTitle.includes('התרעה מקדימה')
+        || alertDesc.includes('התרעה מקדימה')
+        || alertDesc.includes('זיהוי שיגורים');
 
-      if (isNewsFlash) {
-        // Early warning - areas (not cities), with descriptive text
+      // Detect end of event (סיום אירוע)
+      const isEndEvent = alertTitle.includes('הסתיים') || alertTitle.includes('סיום')
+        || alertDesc.includes('יכולים לצאת') || alertDesc.includes('הסתיים')
+        || alert.type === 'endOfEvent';
+
+      if (isEndEvent) {
+        const areas = alert.cities || alert.areas || [];
+        await processAlert({
+          notificationId: alert.notificationId || alert.id || `end_${Date.now()}`,
+          threat: END_EVENT_THREAT,
+          isDrill: alert.isDrill || false,
+          cities: areas,
+          time: alert.time || Math.floor(Date.now() / 1000),
+          title: alertTitle,
+          description: alertDesc || 'האירוע הסתיים. ניתן לצאת מהמרחב המוגן.',
+        });
+      } else if (isNewsFlash) {
         const areas = alert.cities || alert.areas || alert.zones || [];
-        const description = alert.desc || alert.description || alert.body
-          || alert.instructions || 'זוהו שיגורים - היכנסו למרחב מוגן!';
+        const description = alertDesc || 'זוהו שיגורים - היכנסו למרחב מוגן!';
         await processAlert({
           notificationId: alert.notificationId || alert.id || `newsflash_${Date.now()}`,
           threat: NEWSFLASH_THREAT,
           isDrill: alert.isDrill || false,
           cities: areas,
           time: alert.time || Math.floor(Date.now() / 1000),
+          title: alertTitle,
           description,
         });
       } else if (alert.cities && alert.cities.length > 0) {
@@ -301,6 +348,8 @@ async function poll() {
           isDrill: alert.isDrill || false,
           cities: alert.cities || [],
           time: alert.time || Math.floor(Date.now() / 1000),
+          title: alertTitle,
+          description: alertDesc || undefined,
         });
       }
     }
@@ -393,19 +442,24 @@ async function pollOref() {
 
       if (cities.length === 0 && !isNewsFlash) continue;
 
-      const alertId = `oref_${alert.id || cat + '_' + Date.now()}`;
+      // Use Oref alert ID for dedup (also prevents Tzofar duplicate)
+      const alertId = alert.id ? `oref_${alert.id}` : `oref_${cat}_${Date.now()}`;
 
-      const description = isNewsFlash
-        ? (alert.title || alert.desc || 'התרעה מקדימה - היכנסו למרחב מוגן!')
-        : undefined;
+      const alertTitle = alert.title || '';
+      const alertDesc = alert.desc || '';
+
+      // Detect end-of-event: "האירוע הסתיים", "יכולים לצאת"
+      const isEndEvent = alertTitle.includes('הסתיים') || alertTitle.includes('סיום')
+        || alertDesc.includes('יכולים לצאת') || alertDesc.includes('הסתיים');
 
       await processAlert({
         notificationId: alertId,
-        threat,
+        threat: isEndEvent ? END_EVENT_THREAT : threat,
         isDrill: alert.isDrill || false,
         cities,
         time: Math.floor(Date.now() / 1000),
-        description,
+        title: alertTitle,
+        description: alertDesc || alertTitle || (isNewsFlash ? 'התרעה מקדימה' : undefined),
       });
     }
   } catch (err) {
@@ -456,10 +510,27 @@ const server = http.createServer((req, res) => {
       isDrill: false,
       cities: ['שפלת יהודה', 'דן', 'ירקון', 'השפלה', 'שרון'],
       time: Math.floor(Date.now() / 1000),
+      title: 'התרעה מקדימה',
       description: 'בעקבות זיהוי שיגורים, בדקות הקרובות צפויות להתקבל התרעות',
     }).then(() => {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ sent: true, type: 'early_warning' }));
+    }).catch(err => {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    });
+  } else if (req.url === '/test-end-event') {
+    processAlert({
+      notificationId: `test_end_${Date.now()}`,
+      threat: END_EVENT_THREAT,
+      isDrill: false,
+      cities: ['תל אביב', 'ראשון לציון', 'חולון'],
+      time: Math.floor(Date.now() / 1000),
+      title: 'האירוע הסתיים',
+      description: 'השוהים במרחב המוגן יכולים לצאת. בעת קבלת הנחיה או התרעה, יש לפעול בהתאם להנחיות פיקוד העורף.',
+    }).then(() => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ sent: true, type: 'end_of_event' }));
     }).catch(err => {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: err.message }));
