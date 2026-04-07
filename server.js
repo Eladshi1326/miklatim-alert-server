@@ -464,6 +464,31 @@ const server = http.createServer((req, res) => {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: err.message }));
     });
+  } else if (req.url === '/test-oref') {
+    // Debug endpoint - check what Railway sees from Oref API
+    (async () => {
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 5000);
+        const r = await fetch(OREF_ALERTS_URL, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json',
+            'Referer': 'https://www.oref.org.il/',
+            'X-Requested-With': 'XMLHttpRequest',
+            'Accept-Language': 'he-IL,he;q=0.9',
+          },
+          signal: controller.signal,
+        });
+        clearTimeout(timeout);
+        const text = await r.text();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: r.status, contentLength: text.length, body: text.substring(0, 500) }));
+      } catch (err) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    })();
   } else {
     res.writeHead(404);
     res.end('Not found');
