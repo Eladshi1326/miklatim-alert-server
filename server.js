@@ -1,9 +1,12 @@
 /**
- * Miklatim Alert Server v3
+ * Miklatim Alert Server v5
  *
  * Polls Tzofar REST API for real-time alerts in Israel.
  * Sends push notifications to admin only (for testing phase).
- * Supports ALL threat types.
+ * Supports ALL threat types including early warnings and end-of-event.
+ *
+ * Note: Early warnings (התרעה מקדימה) and end-of-event (סיום אירוע)
+ * require Oref API access (Israeli IP). Set OREF_PROXY_URL if available.
  *
  * Deploy on Railway / Render / any Node.js host.
  */
@@ -23,8 +26,12 @@ const ADMIN_USER_ID = process.env.ADMIN_USER_ID || '';
 
 // Alert sources
 const TZOFAR_API_URL = 'https://api.tzevaadom.co.il/notifications';
+
+// Oref API - only works from Israeli IP or via proxy
 const OREF_PROXY_URL = process.env.OREF_PROXY_URL || '';
+const OREF_PROXY_SECRET = process.env.OREF_PROXY_SECRET || '';
 const OREF_ALERTS_URL = OREF_PROXY_URL || 'https://www.oref.org.il/WarningMessages/alert/alerts.json';
+const OREF_ENABLED = !!OREF_PROXY_URL; // Only poll Oref if proxy is configured
 
 // Polling interval
 const POLL_INTERVAL_MS = 2000;
@@ -43,7 +50,7 @@ let orefConnected = false;
 let pollCount = 0;
 let orefPollCount = 0;
 
-// ALL threat type labels (Tzofar/Pikud HaOref types)
+// ALL threat type labels
 const THREAT_LABELS = {
   0: '🚀 ירי רקטות וטילים',
   1: '☢️ אירוע רדיולוגי',
@@ -61,9 +68,14 @@ const THREAT_LABELS = {
   13: '🛡️ היערכות',
 };
 
-// Special threat types for newsFlash subtypes
 const NEWSFLASH_THREAT = 10;
-const END_EVENT_THREAT = 99; // custom type for "end of event"
+const END_EVENT_THREAT = 99;
+
+// Oref category mapping
+const OREF_CATEGORY_MAP = {
+  1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 7: 6,
+  10: NEWSFLASH_THREAT, 13: NEWSFLASH_THREAT, 14: NEWSFLASH_THREAT,
+};
 
 // ==================== LOGGING ====================
 
@@ -89,13 +101,9 @@ setInterval(() => {
 
 // ==================== PUSH NOTIFICATIONS ====================
 
-/**
- * Get push tokens - admin only during testing phase
- */
 async function getTargetPushTokens() {
   try {
     if (ADMIN_USER_ID) {
-      // Testing mode: only send to admin
       const { data, error } = await supabase
         .from('users')
         .select('push_token')
@@ -109,7 +117,6 @@ async function getTargetPushTokens() {
       return [data.push_token];
     }
 
-    // Production mode: send to all users with tokens
     let allTokens = [];
     let offset = 0;
     const batchSize = 1000;
@@ -138,7 +145,7 @@ async function getTargetPushTokens() {
 async function sendPushNotifications(tokens, title, body, data = {}) {
   if (!tokens.length) return;
 
-  log(`📤 Push to ${tokens.length} user(s): "${title}" - "${body}"`);
+  log(`📤 Push to ${tokens.length} user(s): "${title}" - "${body.substring(0, 60)}"`);
 
   const BATCH_SIZE = 100;
   for (let i = 0; i < tokens.length; i += BATCH_SIZE) {
@@ -187,7 +194,7 @@ async function processAlert(alertData) {
   const isDrillAlert = isDrill || false;
   const citiesStr = (cities || []).join(', ');
 
-  // Determine alert subtype for cat 10 (newsFlash)
+  // Determine alert subtype
   const isEndOfEvent = threat === END_EVENT_THREAT
     || (threat === NEWSFLASH_THREAT && title && (
       title.includes('הסתיים') || title.includes('סיום') || title.includes('חזרה לשגרה')
@@ -226,7 +233,6 @@ async function processAlert(alertData) {
     pushBody = citiesStr || 'היכנס למרחב מוגן!';
   }
 
-  // Determine notification type for app navigation
   let pushType = 'rocket_alert';
   if (isEndOfEvent) pushType = 'end_of_event';
   else if (isEarlyWarning) pushType = 'early_warning';
@@ -258,7 +264,7 @@ async function processAlert(alertData) {
   });
 }
 
-// ==================== POLLING ====================
+// ==================== TZOFAR POLLING ====================
 
 async function poll() {
   lastPollTime = new Date().toISOString();
@@ -305,43 +311,39 @@ async function poll() {
       const alertTitle = alert.title || alert.name || '';
       const alertDesc = alert.desc || alert.description || alert.body || '';
 
-      // Detect newsFlash / early warning (התרעה מקדימה)
+      // Detect newsFlash / early warning
       const isNewsFlash = alert.cat === 10 || alert.category === 10
         || alert.type === 'newsFlash' || alert.type === 'earlyWarning'
         || alertTitle.includes('התרעה מקדימה')
         || alertDesc.includes('התרעה מקדימה')
         || alertDesc.includes('זיהוי שיגורים');
 
-      // Detect end of event (סיום אירוע)
+      // Detect end of event
       const isEndEvent = alertTitle.includes('הסתיים') || alertTitle.includes('סיום')
         || alertDesc.includes('יכולים לצאת') || alertDesc.includes('הסתיים')
         || alert.type === 'endOfEvent';
 
       if (isEndEvent) {
-        const areas = alert.cities || alert.areas || [];
         await processAlert({
           notificationId: alert.notificationId || alert.id || `end_${Date.now()}`,
           threat: END_EVENT_THREAT,
           isDrill: alert.isDrill || false,
-          cities: areas,
+          cities: alert.cities || alert.areas || [],
           time: alert.time || Math.floor(Date.now() / 1000),
           title: alertTitle,
           description: alertDesc || 'האירוע הסתיים. ניתן לצאת מהמרחב המוגן.',
         });
       } else if (isNewsFlash) {
-        const areas = alert.cities || alert.areas || alert.zones || [];
-        const description = alertDesc || 'זוהו שיגורים - היכנסו למרחב מוגן!';
         await processAlert({
           notificationId: alert.notificationId || alert.id || `newsflash_${Date.now()}`,
           threat: NEWSFLASH_THREAT,
           isDrill: alert.isDrill || false,
-          cities: areas,
+          cities: alert.cities || alert.areas || alert.zones || [],
           time: alert.time || Math.floor(Date.now() / 1000),
           title: alertTitle,
-          description,
+          description: alertDesc || 'זוהו שיגורים - היכנסו למרחב מוגן!',
         });
       } else if (alert.cities && alert.cities.length > 0) {
-        // Regular alert (missiles, infiltration, etc.)
         await processAlert({
           notificationId: alert.notificationId || alert.id || `tzofar_${Date.now()}`,
           threat: alert.threat ?? 0,
@@ -360,37 +362,32 @@ async function poll() {
   }
 }
 
-// ==================== OREF API POLLING (for newsFlash / early warnings) ====================
-
-// Pikud HaOref alert category mapping
-const OREF_CATEGORY_MAP = {
-  1: 0,   // missiles
-  2: 1,   // radiologicalEvent
-  3: 2,   // earthQuake
-  4: 3,   // tsunami
-  5: 4,   // hostileAircraftIntrusion
-  6: 5,   // hazardousMaterials
-  7: 6,   // terroristInfiltration
-  10: NEWSFLASH_THREAT, // newsFlash / early warning
-  13: NEWSFLASH_THREAT, // newsFlash (history format)
-  14: NEWSFLASH_THREAT, // newsFlash (history format alt)
-};
+// ==================== OREF POLLING (optional - needs Israeli IP or proxy) ====================
 
 async function pollOref() {
+  if (!OREF_ENABLED) return;
+
   orefPollCount++;
 
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 4000);
 
+    const headers = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      'Accept': 'application/json',
+    };
+    // If using proxy, send secret header. If direct, send Oref headers.
+    if (OREF_PROXY_URL && OREF_PROXY_SECRET) {
+      headers['X-Api-Secret'] = OREF_PROXY_SECRET;
+    } else {
+      headers['Referer'] = 'https://www.oref.org.il/';
+      headers['X-Requested-With'] = 'XMLHttpRequest';
+      headers['Accept-Language'] = 'he-IL,he;q=0.9';
+    }
+
     const response = await fetch(OREF_ALERTS_URL, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json',
-        'Referer': 'https://www.oref.org.il/',
-        'X-Requested-With': 'XMLHttpRequest',
-        'Accept-Language': 'he-IL,he;q=0.9',
-      },
+      headers,
       signal: controller.signal,
     });
     clearTimeout(timeout);
@@ -403,7 +400,6 @@ async function pollOref() {
       return;
     }
 
-    // Oref API sometimes returns empty string or BOM characters
     let text = await response.text();
     text = text.replace(/^\uFEFF/, '').trim();
 
@@ -427,7 +423,6 @@ async function pollOref() {
       log('✅ Oref API connected');
     }
 
-    // Oref returns either a single object or array
     const alerts = Array.isArray(data) ? data : [data];
 
     for (const alert of alerts) {
@@ -435,20 +430,16 @@ async function pollOref() {
       const threat = OREF_CATEGORY_MAP[cat] ?? 0;
       const isNewsFlash = threat === NEWSFLASH_THREAT;
 
-      // Build cities/areas from Oref format
       const cities = alert.data
         ? (typeof alert.data === 'string' ? alert.data.split(',').map(s => s.trim()) : alert.data)
         : (alert.cities || []);
 
       if (cities.length === 0 && !isNewsFlash) continue;
 
-      // Use Oref alert ID for dedup (also prevents Tzofar duplicate)
       const alertId = alert.id ? `oref_${alert.id}` : `oref_${cat}_${Date.now()}`;
-
       const alertTitle = alert.title || '';
       const alertDesc = alert.desc || '';
 
-      // Detect end-of-event: "האירוע הסתיים", "יכולים לצאת"
       const isEndEvent = alertTitle.includes('הסתיים') || alertTitle.includes('סיום')
         || alertDesc.includes('יכולים לצאת') || alertDesc.includes('הסתיים');
 
@@ -478,9 +469,9 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       status: 'running',
-      version: 4,
+      version: 5,
       tzofar: sourceConnected ? 'connected' : 'disconnected',
-      oref: orefConnected ? 'connected' : 'disconnected',
+      oref: OREF_ENABLED ? (orefConnected ? 'connected' : 'disconnected') : 'disabled',
       mode: ADMIN_USER_ID ? 'admin-only' : 'all-users',
       pollCount,
       orefPollCount,
@@ -535,31 +526,6 @@ const server = http.createServer((req, res) => {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: err.message }));
     });
-  } else if (req.url === '/test-oref') {
-    // Debug endpoint - check what Railway sees from Oref API
-    (async () => {
-      try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 5000);
-        const r = await fetch(OREF_ALERTS_URL, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'application/json',
-            'Referer': 'https://www.oref.org.il/',
-            'X-Requested-With': 'XMLHttpRequest',
-            'Accept-Language': 'he-IL,he;q=0.9',
-          },
-          signal: controller.signal,
-        });
-        clearTimeout(timeout);
-        const text = await r.text();
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: r.status, contentLength: text.length, body: text.substring(0, 500) }));
-      } catch (err) {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: err.message }));
-      }
-    })();
   } else {
     res.writeHead(404);
     res.end('Not found');
@@ -569,7 +535,7 @@ const server = http.createServer((req, res) => {
 // ==================== START ====================
 
 function start() {
-  log('🚀 Miklatim Alert Server v4');
+  log('🚀 Miklatim Alert Server v5');
 
   if (!SUPABASE_URL || !SUPABASE_KEY) {
     console.error('Missing SUPABASE_URL or SUPABASE_SERVICE_KEY!');
@@ -577,23 +543,26 @@ function start() {
   }
 
   log(`Mode: ${ADMIN_USER_ID ? 'ADMIN ONLY (' + ADMIN_USER_ID + ')' : 'ALL USERS'}`);
-  log(`Sources: Tzofar (${TZOFAR_API_URL}) + Oref (${OREF_ALERTS_URL})`);
+  log(`Tzofar: ${TZOFAR_API_URL}`);
+  log(`Oref: ${OREF_ENABLED ? OREF_ALERTS_URL : 'DISABLED (no proxy configured)'}`);
 
   server.listen(PORT, () => {
     log(`Health server on port ${PORT}`);
   });
 
-  // Tzofar polling - regular alerts (every 2s)
+  // Tzofar polling (every 2s)
   setInterval(poll, POLL_INTERVAL_MS);
   poll();
 
-  // Oref polling - newsFlash / early warnings (every 2s)
-  setInterval(pollOref, POLL_INTERVAL_MS);
-  setTimeout(pollOref, 1000); // stagger by 1s
+  // Oref polling (every 2s) - only if proxy is configured
+  if (OREF_ENABLED) {
+    setInterval(pollOref, POLL_INTERVAL_MS);
+    setTimeout(pollOref, 1000);
+  }
 
   // Status log every 5 minutes
   setInterval(() => {
-    log(`📊 tzofar=${pollCount} oref=${orefPollCount} alerts=${totalAlertsSent} tzofar=${sourceConnected ? 'OK' : 'DOWN'} oref=${orefConnected ? 'OK' : 'DOWN'} seen=${seenAlerts.size}`);
+    log(`📊 polls=${pollCount} oref=${orefPollCount} alerts=${totalAlertsSent} tzofar=${sourceConnected ? 'OK' : 'DOWN'} oref=${OREF_ENABLED ? (orefConnected ? 'OK' : 'DOWN') : 'OFF'} seen=${seenAlerts.size}`);
   }, 300000);
 
   process.on('SIGTERM', () => {
